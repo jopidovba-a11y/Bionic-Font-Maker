@@ -42,8 +42,8 @@
     <label for="bold">Bold font of the same family (optional, looks better than synthetic bold)</label>
     <input type="file" id="bold" accept=".ttf,.otf">
 
-    <label for="ratio">Bold portion of each word: <output id="ratioOut">50%</output></label>
-    <input type="range" id="ratio" min="30" max="70" step="5" value="50">
+    <label for="ratio">Bold portion of each word: <output id="ratioOut">42%</output></label>
+    <input type="range" id="ratio" min="30" max="70" step="1" value="42">
 
     <label for="skip">Short words</label>
     <select id="skip">
@@ -103,6 +103,13 @@ def _load(path):
     return f
 
 
+def _bold_count(n, ratio):
+    # Number of bold letters for a word of n letters. Rounds down (+0.35 bias), at least 1.
+    # With ratio 0.42 this gives: 1-3 letters -> 1, 4-6 -> 2, 7-8 -> 3, 9-11 -> 4, 14 -> 6,
+    # matching the curve measured from a professional bionic font.
+    return max(1, math.floor(n * ratio + 0.35))
+
+
 def _build_fea(names, apos, max_len, ratio, skip):
     L = ' '.join(names)
     B = ' '.join(n + '.bf' for n in names)
@@ -135,7 +142,7 @@ def _build_fea(names, apos, max_len, ratio, skip):
     # Words with up to "skip" letters get no bold at all (every letter becomes a tail glyph,
     # which is restored to the regular letter at the end).
     for n in range(max_len, 0, -1):
-        k = 0 if n <= skip else max(1, math.ceil(n * ratio))
+        k = 0 if n <= skip else _bold_count(n, ratio)
         parts = ["@L' lookup TOBOLD"] * k + ["@L' lookup TOTAIL"] * (n - k)
         out.append('    sub ' + ' '.join(parts) + ';')
     out += [
