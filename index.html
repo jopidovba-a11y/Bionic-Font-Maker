@@ -21,6 +21,7 @@
   .btn, button { display:inline-block; margin-top:16px; padding:10px 18px; border:0; border-radius:8px;
     background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; text-decoration:none; }
   button:disabled { opacity:.45; cursor:not-allowed; }
+  .btn.disabled { opacity:.45; cursor:not-allowed; }
   #dl { margin-left:8px; }
   pre { margin:16px 0 0; padding:10px; background:var(--bg); border:1px solid var(--line); border-radius:8px;
     max-height:220px; overflow:auto; white-space:pre-wrap; font-size:.8rem; }
@@ -46,7 +47,7 @@
     <input type="range" id="weight" min="0.005" max="0.04" step="0.005" value="0.02">
 
     <button id="go" disabled>Generate font</button>
-    <a id="dl" class="btn" hidden>Download</a>
+    <a id="dl" class="btn disabled" aria-disabled="true">Download</a>
     <pre id="log"></pre>
   </div>
 
@@ -260,7 +261,7 @@ def make_bionic(reg_path, bold_path, weight, ratio, max_len, suffix, out_path):
 
 // ---------------------------------------------------------------- JS side
 const $ = id => document.getElementById(id);
-let pyodide = null, pyReady = false, busy = false, dlUrl = null;
+let pyodide = null, pyReady = false, busy = false, dlUrl = null, initFailed = false;
 
 function log(msg) {
   const el = $('log');
@@ -272,29 +273,65 @@ function refresh() {
   $('go').disabled = !(pyReady && !busy && $('regular').files.length);
 }
 
+// Replaces the log with a status line that reflects the current state
+function showStatus() {
+  if (initFailed) return; // keep the error message visible
+  const f = $('regular').files[0];
+  $('log').textContent = '';
+  if (!pyReady) {
+    log(f ? `Selected: ${f.name}. Waiting for the Python runtime to finish loading...`
+          : 'Loading Python runtime (first visit only, may take a bit)...');
+  } else {
+    log(f ? `Selected: ${f.name}. Press "Generate font".`
+          : 'Ready. Choose a font file.');
+  }
+}
+
+// Enables the download button with a file, or dims it (url = null) until there is one
+function setDownload(url, name) {
+  const a = $('dl');
+  if (url) {
+    a.href = url;
+    a.download = name;
+    a.textContent = 'Download ' + name;
+    a.classList.remove('disabled');
+    a.removeAttribute('aria-disabled');
+  } else {
+    a.removeAttribute('href');
+    a.removeAttribute('download');
+    a.textContent = 'Download';
+    a.classList.add('disabled');
+    a.setAttribute('aria-disabled', 'true');
+  }
+}
+
 async function initPython() {
   try {
-    log('Loading Python runtime (first visit only, may take a bit)...');
+    showStatus();
     pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
     await pyodide.loadPackage('micropip');
     await pyodide.pyimport('micropip').install('fonttools');
     pyodide.runPython(PY_CODE);
     pyReady = true;
-    log('Ready. Choose a font file.');
+    showStatus();
   } catch (e) {
+    initFailed = true;
     log('Failed to load runtime:\n' + e);
   }
   refresh();
 }
 
-$('regular').addEventListener('change', refresh);
+$('dl').addEventListener('click', e => {
+  if ($('dl').classList.contains('disabled')) e.preventDefault();
+});
+$('regular').addEventListener('change', () => { refresh(); showStatus(); });
 $('ratio').addEventListener('input', e => { $('ratioOut').textContent = e.target.value + '%'; });
 $('weight').addEventListener('input', e => { $('weightOut').textContent = parseFloat(e.target.value).toFixed(3); });
 
 $('go').addEventListener('click', async () => {
   busy = true;
   refresh();
-  $('dl').hidden = true;
+  setDownload(null);
   try {
     const regFile = $('regular').files[0];
     const boldFile = $('bold').files[0];
@@ -320,10 +357,7 @@ $('go').addEventListener('click', async () => {
 
     if (dlUrl) URL.revokeObjectURL(dlUrl);
     dlUrl = URL.createObjectURL(new Blob([out], { type: 'font/' + ext }));
-    $('dl').href = dlUrl;
-    $('dl').download = fileName;
-    $('dl').textContent = 'Download ' + fileName;
-    $('dl').hidden = false;
+    setDownload(dlUrl, fileName);
 
     log(`Done: ${n} letter glyphs processed.`);
   } catch (e) {
