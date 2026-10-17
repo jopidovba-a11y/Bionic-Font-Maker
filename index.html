@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Bionic Font Maker</title>
+<style>
+  :root { --bg:#fafaf8; --fg:#1d1d1b; --muted:#6b6b66; --card:#fff; --line:#dcdcd6; --accent:#2f5bea; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161616; --fg:#eee; --muted:#9a9a94; --card:#1f1f1f; --line:#333; --accent:#7c9bff; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:16px/1.5 system-ui, sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:24px 16px 64px; }
+  h1 { margin:0 0 4px; font-size:1.6rem; }
+  .muted { color:var(--muted); font-size:.9rem; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:16px; margin-top:16px; }
+  label { display:block; margin:12px 0 4px; font-weight:600; font-size:.9rem; }
+  input[type=file] { width:100%; }
+  input[type=range] { width:100%; }
+  .btn, button { display:inline-block; margin-top:16px; padding:10px 18px; border:0; border-radius:8px;
+    background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; text-decoration:none; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  #dl { margin-left:8px; }
+  pre { margin:16px 0 0; padding:10px; background:var(--bg); border:1px solid var(--line); border-radius:8px;
+    max-height:220px; overflow:auto; white-space:pre-wrap; font-size:.8rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Bionic Font Maker</h1>
+  <p class="muted">Upload a TTF/OTF font and get a copy where the first letters of every word are bold.
+    Everything runs in your browser; nothing is uploaded anywhere.</p>
+
+  <div class="card">
+    <label for="regular">Regular font (required)</label>
+    <input type="file" id="regular" accept=".ttf,.otf">
+
+    <label for="bold">Bold font of the same family (optional, looks better than synthetic bold)</label>
+    <input type="file" id="bold" accept=".ttf,.otf">
+
+    <label for="ratio">Bold portion of each word: <output id="ratioOut">50%</output></label>
+    <input type="range" id="ratio" min="30" max="70" step="5" value="50">
+
+    <label for="weight">Synthetic boldness (ignored if a bold font is provided): <output id="weightOut">0.020</output> em</label>
+    <input type="range" id="weight" min="0.005" max="0.04" step="0.005" value="0.02">
+
+    <button id="go" disabled>Generate font</button>
+    <a id="dl" class="btn" hidden>Download</a>
+    <pre id="log"></pre>
+  </div>
+
+  <p class="muted">Notes: only static fonts are supported (no variable fonts). Latin, Greek and Cyrillic letters are processed.
+    The font's existing GSUB features (ligatures, etc.) are replaced. The reader app must shape text with HarfBuzz
+    for the effect to show.</p>
+</main>
+
+<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
+<script>
+const PYODIDE_URL = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
+const MAX_LEN = 14; // longest word (in letters) that gets exact bolding rules; fewer rules = faster shaping
+
+// ---------------------------------------------------------------- Python side
+const PY_CODE = String.raw`
+import io, math, re, unicodedata
+from fontTools.ttLib import TTFont
+from fontTools.pens.recordingPen import DecomposingRecordingPen
+from fontTools.pens.transformPen import TransformPen
+from fontTools.pens.boundsPen import BoundsPen
+from fontTools.pens.ttGlyphPen import TTGlyphPen
+from fontTools.pens.t2CharStringPen import T2CharStringPen
+from fontTools.pens.cu2quPen import Cu2QuPen
+from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
+
+NAME_OK = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]*$')
+SCRIPTS = ('LATIN', 'GREEK', 'CYRILLIC')
+
+
+def _is_letter(cp):
+    try:
+        ch = chr(cp)
+        return unicodedata.category(ch).startswith('L') and unicodedata.name(ch).startswith(SCRIPTS)
+    except ValueError:
+        return False
+
+
+def _load(path):
+    f = TTFont(path, lazy=False)
+    if 'fvar' in f or 'CFF2' in f:
+        raise ValueError('Variable fonts are not supported. Use a static font.')
+    if 'CFF ' in f and hasattr(f['CFF '].cff.topDictIndex[0], 'ROS'):
+        raise ValueError('CID-keyed CFF fonts are not supported.')
+    return f
+
+
+def _build_fea(names, apos, max_len, ratio):
+    L = ' '.join(names)
+    B = ' '.join(n + '.bf' for n in names)
+    T = ' '.join(n + '.tl' for n in names)
+    out = [
+        'languagesystem DFLT dflt;',
+        'languagesystem latn dflt;',
+        'languagesystem grek dflt;',
+        'languagesystem cyrl dflt;',
+        '@L = [' + L + '];',
+        '@B = [' + B + '];',
+        '@T = [' + T + '];',
+    ]
+    if apos:
+        out.append('@A = [' + ' '.join(apos) + '];')
+    out += [
+        'lookup TOBOLD { sub @L by @B; } TOBOLD;',
+        'lookup TOTAIL { sub @L by @T; } TOTAIL;',
+    ]
+    # Cheap pre-pass for contractions/possessives (Don't, He's, O'Brien): the letters after
+    # "letter + apostrophe" become tail glyphs, so the plain rules below don't treat them
+    # as a new word. Few rules, and each fails immediately on any non-apostrophe glyph.
+    if apos:
+        out += ['lookup APOS {', '    lookupflag IgnoreMarks;']
+        for m in range(6, 0, -1):
+            out.append("    sub @L @A' " + ' '.join(["@L' lookup TOTAIL"] * m) + ';')
+        out.append('} APOS;')
+    out += ['lookup BIONIC {', '    lookupflag IgnoreMarks;']
+    # Plain words. Longest first: the greedy match of the letter run equals the word length.
+    for n in range(max_len, 0, -1):
+        k = max(1, math.ceil(n * ratio))
+        parts = ["@L' lookup TOBOLD"] * k + ["@L' lookup TOTAIL"] * (n - k)
+        out.append('    sub ' + ' '.join(parts) + ';')
+    out += [
+        '} BIONIC;',
+        # Tail glyphs only exist to stop the rules from re-matching mid-word; restore them.
+        'lookup TOREG { sub @T by @L; } TOREG;',
+        'feature calt { ' + ('lookup APOS; ' if apos else '') + 'lookup BIONIC; lookup TOREG; } calt;',
+    ]
+    return '\n'.join(out)
+
+
+def make_bionic(reg_path, bold_path, weight, ratio, max_len, suffix, out_path):
+    font = _load(reg_path)
+    bold = _load(bold_path) if bold_path else None
+    is_cff = 'CFF ' in font
+    upm = font['head'].unitsPerEm
+    gs = font.getGlyphSet()
+    hmtx = font['hmtx']
+    cmap = font.getBestCmap()
+
+    # glyph name -> first codepoint, for Latin/Greek/Cyrillic letters only
+    letters = {}
+    for cp in sorted(cmap):
+        g = cmap[cp]
+        if g not in letters and NAME_OK.match(g) and _is_letter(cp):
+            letters[g] = cp
+    if not letters:
+        raise ValueError('No Latin/Greek/Cyrillic letters found in this font.')
+
+    old_order = list(font.getGlyphOrder())
+    pos = {g: i for i, g in enumerate(old_order)}
+    names = sorted(letters, key=lambda g: pos[g])
+
+    # synthetic bold: union of shifted copies of the outline (dilation)
+    r = weight * upm
+    rv = r * 0.6
+    ring = [(r, 0), (-r, 0), (0, rv), (0, -rv),
+            (.7 * r, .7 * rv), (-.7 * r, .7 * rv), (.7 * r, -.7 * rv), (-.7 * r, -.7 * rv)]
+
+    if bold is not None:
+        bgs = bold.getGlyphSet()
+        bcmap = bold.getBestCmap()
+        bhmtx = bold['hmtx']
+        bscale = upm / bold['head'].unitsPerEm
+        bold_is_cff = 'CFF ' in bold
+
+    def record(glyphset, gname):
+        rp = DecomposingRecordingPen(glyphset)
+        glyphset[gname].draw(rp)
+        return rp
+
+    def build(rec, transforms, adv, cubic_to_quad):
+        bp = BoundsPen(None)
+        for t in transforms:
+            rec.replay(TransformPen(bp, t))
+        bounds = bp.bounds
+        if is_cff:
+            pen = T2CharStringPen(int(adv), None)
+            target = pen
+        else:
+            pen = TTGlyphPen(None)
+            target = Cu2QuPen(pen, 1.0) if cubic_to_quad else pen
+        for t in transforms:
+            rec.replay(TransformPen(target, t))
+        lsb = int(round(bounds[0])) if bounds else 0
+        return pen, (int(adv), lsb)
+
+    new_glyphs = {}
+    for g in names:
+        adv = hmtx[g][0]
+        rec = record(gs, g)
+        new_glyphs[g + '.tl'] = build(rec, [(1, 0, 0, 1, 0, 0)], adv, False)
+        if bold is not None and letters[g] in bcmap:
+            bn = bcmap[letters[g]]
+            brec = record(bgs, bn)
+            badv = round(bhmtx[bn][0] * bscale)
+            new_glyphs[g + '.bf'] = build(brec, [(bscale, 0, 0, bscale, 0, 0)], badv,
+                                          bold_is_cff and not is_cff)
+        else:
+            tr = [(1, 0, 0, 1, r + ox, oy) for ox, oy in ring]
+            new_glyphs[g + '.bf'] = build(rec, tr, adv + round(2 * r), False)
+
+    new_order = [n for g in names for n in (g + '.bf', g + '.tl')]
+    font.setGlyphOrder(old_order + new_order)
+
+    if is_cff:
+        cff = font['CFF '].cff
+        top = cff.topDictIndex[0]
+        cs = top.CharStrings
+        for n in new_order:
+            pen, (adv, lsb) = new_glyphs[n]
+            charstring = pen.getCharString(private=top.Private, globalSubrs=cff.GlobalSubrs)
+            cs.charStrings[n] = len(cs.charStringsIndex.items)
+            cs.charStringsIndex.items.append(charstring)
+            top.charset.append(n)
+            hmtx.metrics[n] = (adv, lsb)
+    else:
+        glyf = font['glyf']
+        glyf.glyphOrder = font.getGlyphOrder()
+        for n in new_order:
+            pen, (adv, lsb) = new_glyphs[n]
+            glyf.glyphs[n] = pen.glyph()
+            hmtx.metrics[n] = (adv, lsb)
+    font['maxp'].numGlyphs = len(font.getGlyphOrder())
+
+    # tables that become invalid after changing glyphs
+    for tag in ('hdmx', 'LTSH', 'VDMX', 'DSIG'):
+        if tag in font:
+            del font[tag]
+
+    # apostrophe glyphs (straight, curly, modifier letter) that exist in this font
+    apos = []
+    for cp in (0x27, 0x2019, 0x02BC):
+        g = cmap.get(cp)
+        if g and NAME_OK.match(g) and g not in apos:
+            apos.append(g)
+
+    addOpenTypeFeaturesFromString(font, _build_fea(names, apos, int(max_len), float(ratio)), tables=['GSUB'])
+
+    # rename so it doesn't clash with the original font
+    tag = suffix.replace(' ', '')
+    for rec in font['name'].names:
+        s = rec.toUnicode()
+        if rec.nameID in (1, 4, 16, 21):
+            rec.string = s + suffix
+        elif rec.nameID == 3:
+            rec.string = s + tag
+        elif rec.nameID == 6:
+            rec.string = s.replace('-', tag + '-', 1) if '-' in s else s + tag
+
+    font.save(out_path)
+    return len(names)
+`;
+
+// ---------------------------------------------------------------- JS side
+const $ = id => document.getElementById(id);
+let pyodide = null, pyReady = false, busy = false, dlUrl = null;
+
+function log(msg) {
+  const el = $('log');
+  el.textContent += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+
+function refresh() {
+  $('go').disabled = !(pyReady && !busy && $('regular').files.length);
+}
+
+async function initPython() {
+  try {
+    log('Loading Python runtime (first visit only, may take a bit)...');
+    pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
+    await pyodide.loadPackage('micropip');
+    await pyodide.pyimport('micropip').install('fonttools');
+    pyodide.runPython(PY_CODE);
+    pyReady = true;
+    log('Ready. Choose a font file.');
+  } catch (e) {
+    log('Failed to load runtime:\n' + e);
+  }
+  refresh();
+}
+
+$('regular').addEventListener('change', refresh);
+$('ratio').addEventListener('input', e => { $('ratioOut').textContent = e.target.value + '%'; });
+$('weight').addEventListener('input', e => { $('weightOut').textContent = parseFloat(e.target.value).toFixed(3); });
+
+$('go').addEventListener('click', async () => {
+  busy = true;
+  refresh();
+  $('dl').hidden = true;
+  try {
+    const regFile = $('regular').files[0];
+    const boldFile = $('bold').files[0];
+    pyodide.FS.writeFile('/tmp/reg.font', new Uint8Array(await regFile.arrayBuffer()));
+    if (boldFile) {
+      pyodide.FS.writeFile('/tmp/bold.font', new Uint8Array(await boldFile.arrayBuffer()));
+    }
+    const ratio = $('ratio').value / 100;
+    const weight = parseFloat($('weight').value);
+    const suffix = ' Bionic';
+
+    log('Processing... (can take several seconds)');
+    await new Promise(r => setTimeout(r, 30)); // let the UI repaint before the heavy work
+
+    const boldArg = boldFile ? "'/tmp/bold.font'" : 'None';
+    const n = pyodide.runPython(
+      `make_bionic('/tmp/reg.font', ${boldArg}, ${weight}, ${ratio}, ${MAX_LEN}, ${JSON.stringify(suffix)}, '/tmp/out.font')`
+    );
+
+    const out = pyodide.FS.readFile('/tmp/out.font');
+    const ext = ((regFile.name.match(/\.(ttf|otf)$/i) || [])[1] || 'ttf').toLowerCase();
+    const fileName = regFile.name.replace(/\.(ttf|otf)$/i, '') + '-Bionic.' + ext;
+
+    if (dlUrl) URL.revokeObjectURL(dlUrl);
+    dlUrl = URL.createObjectURL(new Blob([out], { type: 'font/' + ext }));
+    $('dl').href = dlUrl;
+    $('dl').download = fileName;
+    $('dl').textContent = 'Download ' + fileName;
+    $('dl').hidden = false;
+
+    log(`Done: ${n} letter glyphs processed.`);
+  } catch (e) {
+    log('Error:\n' + e.message);
+  }
+  busy = false;
+  refresh();
+});
+
+initPython();
+</script>
+</body>
+</html>
