@@ -18,6 +18,8 @@
   label { display:block; margin:12px 0 4px; font-weight:600; font-size:.9rem; }
   input[type=file] { width:100%; }
   input[type=range] { width:100%; }
+  select { width:100%; padding:8px; font:inherit; background:var(--bg); color:var(--fg);
+    border:1px solid var(--line); border-radius:8px; }
   .btn, button { display:inline-block; margin-top:16px; padding:10px 18px; border:0; border-radius:8px;
     background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; text-decoration:none; }
   button:disabled { opacity:.45; cursor:not-allowed; }
@@ -42,6 +44,13 @@
 
     <label for="ratio">Bold portion of each word: <output id="ratioOut">50%</output></label>
     <input type="range" id="ratio" min="30" max="70" step="5" value="50">
+
+    <label for="skip">Short words</label>
+    <select id="skip">
+      <option value="0">Bold all words</option>
+      <option value="1">Don't bold 1-letter words</option>
+      <option value="2">Don't bold words of 1-2 letters</option>
+    </select>
 
     <label for="weight">Synthetic boldness (ignored if a bold font is provided): <output id="weightOut">0.020</output> em</label>
     <input type="range" id="weight" min="0.005" max="0.04" step="0.005" value="0.02">
@@ -94,7 +103,7 @@ def _load(path):
     return f
 
 
-def _build_fea(names, apos, max_len, ratio):
+def _build_fea(names, apos, max_len, ratio, skip):
     L = ' '.join(names)
     B = ' '.join(n + '.bf' for n in names)
     T = ' '.join(n + '.tl' for n in names)
@@ -123,8 +132,10 @@ def _build_fea(names, apos, max_len, ratio):
         out.append('} APOS;')
     out += ['lookup BIONIC {', '    lookupflag IgnoreMarks;']
     # Plain words. Longest first: the greedy match of the letter run equals the word length.
+    # Words with up to "skip" letters get no bold at all (every letter becomes a tail glyph,
+    # which is restored to the regular letter at the end).
     for n in range(max_len, 0, -1):
-        k = max(1, math.ceil(n * ratio))
+        k = 0 if n <= skip else max(1, math.ceil(n * ratio))
         parts = ["@L' lookup TOBOLD"] * k + ["@L' lookup TOTAIL"] * (n - k)
         out.append('    sub ' + ' '.join(parts) + ';')
     out += [
@@ -136,7 +147,7 @@ def _build_fea(names, apos, max_len, ratio):
     return '\n'.join(out)
 
 
-def make_bionic(reg_path, bold_path, weight, ratio, max_len, suffix, out_path):
+def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_path):
     font = _load(reg_path)
     bold = _load(bold_path) if bold_path else None
     is_cff = 'CFF ' in font
@@ -242,7 +253,8 @@ def make_bionic(reg_path, bold_path, weight, ratio, max_len, suffix, out_path):
         if g and NAME_OK.match(g) and g not in apos:
             apos.append(g)
 
-    addOpenTypeFeaturesFromString(font, _build_fea(names, apos, int(max_len), float(ratio)), tables=['GSUB'])
+    fea = _build_fea(names, apos, int(max_len), float(ratio), int(skip))
+    addOpenTypeFeaturesFromString(font, fea, tables=['GSUB'])
 
     # rename so it doesn't clash with the original font
     tag = suffix.replace(' ', '')
@@ -341,6 +353,7 @@ $('go').addEventListener('click', async () => {
     }
     const ratio = $('ratio').value / 100;
     const weight = parseFloat($('weight').value);
+    const skip = parseInt($('skip').value, 10); // 0 = bold all, 1 = skip 1-letter words, 2 = skip 1-2 letters
     const suffix = ' Bionic';
 
     log('Processing... (can take several seconds)');
@@ -348,7 +361,7 @@ $('go').addEventListener('click', async () => {
 
     const boldArg = boldFile ? "'/tmp/bold.font'" : 'None';
     const n = pyodide.runPython(
-      `make_bionic('/tmp/reg.font', ${boldArg}, ${weight}, ${ratio}, ${MAX_LEN}, ${JSON.stringify(suffix)}, '/tmp/out.font')`
+      `make_bionic('/tmp/reg.font', ${boldArg}, ${weight}, ${ratio}, ${skip}, ${MAX_LEN}, ${JSON.stringify(suffix)}, '/tmp/out.font')`
     );
 
     const out = pyodide.FS.readFile('/tmp/out.font');
