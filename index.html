@@ -24,63 +24,114 @@
     background:var(--accent); color:#fff; font:inherit; font-weight:600; cursor:pointer; text-decoration:none; }
   button:disabled { opacity:.45; cursor:not-allowed; }
   .btn.disabled { opacity:.45; cursor:not-allowed; }
-  #dl { margin-left:8px; }
+  #dl, #dlEpub { margin-left:8px; }
   pre { margin:16px 0 0; padding:10px; background:var(--bg); border:1px solid var(--line); border-radius:8px;
     max-height:220px; overflow:auto; white-space:pre-wrap; font-size:.8rem; }
+  .tabs { display:flex; gap:4px; margin-top:16px; border-bottom:1px solid var(--line); }
+  .tab { background:transparent; color:var(--muted); border:0; border-bottom:2px solid transparent;
+    border-radius:0; padding:10px 14px; margin:0; font:inherit; font-weight:600; cursor:pointer; }
+  .tab.active { color:var(--fg); border-bottom-color:var(--accent); }
+  .panel { display:none; }
+  .panel.active { display:block; }
 </style>
 </head>
 <body>
 <main>
   <h1>Bionic Font Maker</h1>
-  <p class="muted">Upload a TTF/OTF font and get a copy where the first letters of every word are bold.
+  <p class="muted">Turn a font into a bionic font, or convert an EPUB/KEPUB to a bionic version.
     Everything runs in your browser; nothing is uploaded anywhere.</p>
 
-  <div class="card">
-    <label for="regular">Regular font (required)</label>
-    <input type="file" id="regular" accept=".ttf,.otf">
-
-    <label for="bold">Bold font of the same family (optional, looks better than synthetic bold)</label>
-    <input type="file" id="bold" accept=".ttf,.otf">
-
-    <label for="ratio">Bold portion of each word: <output id="ratioOut">42%</output></label>
-    <input type="range" id="ratio" min="30" max="70" step="1" value="42">
-
-    <label for="skip">Short words</label>
-    <select id="skip">
-      <option value="0">Bold all words</option>
-      <option value="1">Don't bold 1-letter words</option>
-      <option value="2">Don't bold words of 1-2 letters</option>
-    </select>
-
-    <label for="weight">Synthetic boldness (ignored if a bold font is provided): <output id="weightOut">0.020</output> em</label>
-    <input type="range" id="weight" min="0.005" max="0.04" step="0.005" value="0.02">
-
-    <button id="go" disabled>Generate font</button>
-    <a id="dl" class="btn disabled" aria-disabled="true">Download</a>
-    <pre id="log"></pre>
+  <div class="tabs">
+    <button class="tab active" data-panel="fontPanel">Font</button>
+    <button class="tab" data-panel="epubPanel">EPUB / KEPUB</button>
   </div>
 
-  <p class="muted">Notes: only static fonts are supported (no variable fonts). Latin, Greek and Cyrillic letters are processed.
-    The font's existing GSUB features (ligatures, etc.) are replaced. The reader app must shape text with HarfBuzz
-    for the effect to show.</p>
+  <!-- ============================ FONT PANEL ============================ -->
+  <div id="fontPanel" class="panel active">
+    <div class="card">
+      <label for="regular">Regular font (required)</label>
+      <input type="file" id="regular" accept=".ttf,.otf">
+
+      <label for="bold">Bold font of the same family (optional, looks better than synthetic bold)</label>
+      <input type="file" id="bold" accept=".ttf,.otf">
+
+      <label for="skip">Short words</label>
+      <select id="skip">
+        <option value="0">Bold all words</option>
+        <option value="1">Don't bold 1-letter words</option>
+        <option value="2">Don't bold words of 1-2 letters</option>
+      </select>
+
+      <label for="weight">Synthetic boldness (ignored if a bold font is provided): <output id="weightOut">0.020</output> em</label>
+      <input type="range" id="weight" min="0.005" max="0.04" step="0.005" value="0.02">
+
+      <button id="go" disabled>Generate font</button>
+      <a id="dl" class="btn disabled" aria-disabled="true">Download</a>
+      <pre id="log"></pre>
+    </div>
+
+    <p class="muted">Notes: only static fonts are supported (no variable fonts). Latin, Greek and Cyrillic letters are processed.
+      The font's existing GSUB features (ligatures, etc.) are replaced. The reader app must shape text with HarfBuzz
+      for the effect to show.</p>
+  </div>
+
+  <!-- ============================ EPUB PANEL ============================ -->
+  <div id="epubPanel" class="panel">
+    <div class="card">
+      <label for="epub">EPUB or KEPUB file</label>
+      <input type="file" id="epub" accept=".epub,.kepub">
+
+      <label for="epubSkip">Short words</label>
+      <select id="epubSkip">
+        <option value="0">Bold all words</option>
+        <option value="1">Don't bold 1-letter words</option>
+        <option value="2">Don't bold words of 1-2 letters</option>
+      </select>
+
+      <button id="goEpub" disabled>Generate bionic EPUB</button>
+      <a id="dlEpub" class="btn disabled" aria-disabled="true">Download</a>
+      <pre id="logEpub"></pre>
+    </div>
+  </div>
 </main>
 
 <script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
 <script>
 const PYODIDE_URL = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
-const MAX_LEN = 14; // longest word (in letters) that gets exact bolding rules; fewer rules = faster shaping
+const MAX_LEN = 14;           // max word length for exact GSUB rules
+const DEFAULT_RATIO = 0.42;   // fixed 42% (previously a slider)
 
 // ---------------------------------------------------------------- Python side
 const PY_CODE = String.raw`
-import io, math, re, unicodedata
+import io, math, re, unicodedata, zipfile
+import xml.etree.ElementTree as ET
 from fontTools.ttLib import TTFont
 from fontTools.pens.recordingPen import DecomposingRecordingPen
 from fontTools.pens.transformPen import TransformPen
 from fontTools.pens.boundsPen import BoundsPen
 from fontTools.pens.ttGlyphPen import TTGlyphPen
 from fontTools.pens.t2CharStringPen import T2CharStringPen
-from fontTools.pens.cu2quPen import Cu2QuPen
 from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
+from html.entities import name2codepoint as _name2cp
+
+# cu2qu is only needed in the (rare) CFF-bold + TTF-regular case.
+# Imported lazily so a missing module doesn't break everything.
+_Cu2QuPen = None
+def _get_cu2qu_pen():
+    global _Cu2QuPen
+    if _Cu2QuPen is not None:
+        return _Cu2QuPen if _Cu2QuPen is not False else None
+    for mod_name, attr in (('fontTools.pens.cu2QuPen', 'Cu2QuPen'),
+                           ('cu2qu.pens', 'Cu2QuPen')):
+        try:
+            mod = __import__(mod_name, fromlist=[attr])
+            _Cu2QuPen = getattr(mod, attr)
+            return _Cu2QuPen
+        except (ImportError, AttributeError):
+            continue
+    _Cu2QuPen = False
+    return None
+
 
 NAME_OK = re.compile(r'^[A-Za-z_][A-Za-z0-9_.]*$')
 SCRIPTS = ('LATIN', 'GREEK', 'CYRILLIC')
@@ -104,9 +155,6 @@ def _load(path):
 
 
 def _bold_count(n, ratio):
-    # Number of bold letters for a word of n letters. Rounds down (+0.35 bias), at least 1.
-    # With ratio 0.42 this gives: 1-3 letters -> 1, 4-6 -> 2, 7-8 -> 3, 9-11 -> 4, 14 -> 6,
-    # matching the curve measured from a professional bionic font.
     return max(1, math.floor(n * ratio + 0.35))
 
 
@@ -129,25 +177,18 @@ def _build_fea(names, apos, max_len, ratio, skip):
         'lookup TOBOLD { sub @L by @B; } TOBOLD;',
         'lookup TOTAIL { sub @L by @T; } TOTAIL;',
     ]
-    # Cheap pre-pass for contractions/possessives (Don't, He's, O'Brien): the letters after
-    # "letter + apostrophe" become tail glyphs, so the plain rules below don't treat them
-    # as a new word. Few rules, and each fails immediately on any non-apostrophe glyph.
     if apos:
         out += ['lookup APOS {', '    lookupflag IgnoreMarks;']
         for m in range(6, 0, -1):
             out.append("    sub @L @A' " + ' '.join(["@L' lookup TOTAIL"] * m) + ';')
         out.append('} APOS;')
     out += ['lookup BIONIC {', '    lookupflag IgnoreMarks;']
-    # Plain words. Longest first: the greedy match of the letter run equals the word length.
-    # Words with up to "skip" letters get no bold at all (every letter becomes a tail glyph,
-    # which is restored to the regular letter at the end).
     for n in range(max_len, 0, -1):
         k = 0 if n <= skip else _bold_count(n, ratio)
         parts = ["@L' lookup TOBOLD"] * k + ["@L' lookup TOTAIL"] * (n - k)
         out.append('    sub ' + ' '.join(parts) + ';')
     out += [
         '} BIONIC;',
-        # Tail glyphs only exist to stop the rules from re-matching mid-word; restore them.
         'lookup TOREG { sub @T by @L; } TOREG;',
         'feature calt { ' + ('lookup APOS; ' if apos else '') + 'lookup BIONIC; lookup TOREG; } calt;',
     ]
@@ -163,7 +204,6 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
     hmtx = font['hmtx']
     cmap = font.getBestCmap()
 
-    # glyph name -> first codepoint, for Latin/Greek/Cyrillic letters only
     letters = {}
     for cp in sorted(cmap):
         g = cmap[cp]
@@ -176,7 +216,6 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
     pos = {g: i for i, g in enumerate(old_order)}
     names = sorted(letters, key=lambda g: pos[g])
 
-    # synthetic bold: union of shifted copies of the outline (dilation)
     r = weight * upm
     rv = r * 0.6
     ring = [(r, 0), (-r, 0), (0, rv), (0, -rv),
@@ -204,7 +243,16 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
             target = pen
         else:
             pen = TTGlyphPen(None)
-            target = Cu2QuPen(pen, 1.0) if cubic_to_quad else pen
+            if cubic_to_quad:
+                C = _get_cu2qu_pen()
+                if C is None:
+                    raise RuntimeError(
+                        'cu2qu is not available in this environment. '
+                        'Upload a bold font in the same format as the regular one '
+                        '(TTF+TTF or OTF+OTF) to avoid CFF-to-TTF conversion.')
+                target = C(pen, 1.0)
+            else:
+                target = pen
         for t in transforms:
             rec.replay(TransformPen(target, t))
         lsb = int(round(bounds[0])) if bounds else 0
@@ -248,12 +296,10 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
             hmtx.metrics[n] = (adv, lsb)
     font['maxp'].numGlyphs = len(font.getGlyphOrder())
 
-    # tables that become invalid after changing glyphs
     for tag in ('hdmx', 'LTSH', 'VDMX', 'DSIG'):
         if tag in font:
             del font[tag]
 
-    # apostrophe glyphs (straight, curly, modifier letter) that exist in this font
     apos = []
     for cp in (0x27, 0x2019, 0x02BC):
         g = cmap.get(cp)
@@ -263,7 +309,6 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
     fea = _build_fea(names, apos, int(max_len), float(ratio), int(skip))
     addOpenTypeFeaturesFromString(font, fea, tables=['GSUB'])
 
-    # rename so it doesn't clash with the original font
     tag = suffix.replace(' ', '')
     for rec in font['name'].names:
         s = rec.toUnicode()
@@ -276,39 +321,274 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
 
     font.save(out_path)
     return len(names)
+
+
+# ======================================================================
+#  EPUB / KEPUB conversion
+# ======================================================================
+_APOS_CODES = {0x27, 0x2019, 0x02BC}
+_SOFT_HYPHEN = 0x00AD
+_HYPHEN_CHARS = {0x002D, 0x2010}
+_XHTML_SKIP = {'script', 'style', 'pre', 'code', 'title', 'head', 'meta', 'link',
+               'svg', 'math', 'ruby', 'rt', 'rp', 'rb', 'b', 'strong'}
+_NS_RE = re.compile(rb'xmlns(?::([\w.-]+))?="([^"]+)"')
+_HEAD_RE = re.compile(rb'^\s*(<\?xml[^>]*\?>)?\s*(<!DOCTYPE[^>]*(?:\[[^\]]*\])?>)?', re.DOTALL)
+_NAMED_ENT_RE = re.compile(rb'&([a-zA-Z][a-zA-Z0-9]*);')
+_SAFE_ENTITIES = {b'amp', b'lt', b'gt', b'quot', b'apos'}
+
+
+def _find_word_groups(text):
+    """Group letter-runs into word units.
+
+    kind:
+      'first' - first run (gets bolded according to the total letter count)
+      'join'  - continuation via soft hyphen or hyphen+whitespace (counts, not bolded)
+      'tail'  - continuation via apostrophe (does NOT count, not bolded)
+    """
+    runs = []
+    start = None
+    for i, ch in enumerate(text):
+        if _is_letter(ord(ch)):
+            if start is None:
+                start = i
+        else:
+            if start is not None:
+                runs.append((start, i))
+                start = None
+    if start is not None:
+        runs.append((start, len(text)))
+    if not runs:
+        return []
+
+    groups = [[(runs[0][0], runs[0][1], 'first')]]
+    for i in range(1, len(runs)):
+        prev_end = runs[i - 1][1]
+        cur_start = runs[i][0]
+        sep = text[prev_end:cur_start]
+
+        if len(sep) == 1 and ord(sep) in _APOS_CODES:
+            kind = 'tail'
+        elif len(sep) == 1 and ord(sep) == _SOFT_HYPHEN:
+            kind = 'join'
+        elif (len(sep) >= 2 and ord(sep[0]) in _HYPHEN_CHARS
+              and sep[1:].strip() == ''):
+            kind = 'join'
+        else:
+            kind = None
+
+        if kind is None:
+            groups.append([(runs[i][0], runs[i][1], 'first')])
+        else:
+            groups[-1].append((runs[i][0], runs[i][1], kind))
+
+    return groups
+
+
+def _build_bionic_segments(text, ratio, skip=0):
+    segments = []
+    prev_end = 0
+    for group in _find_word_groups(text):
+        total = sum(end - start for start, end, kind in group if kind != 'tail')
+        for idx, (start, end, kind) in enumerate(group):
+            if start > prev_end:
+                segments.append((text[prev_end:start], False))
+            run = text[start:end]
+            if kind == 'tail' or kind == 'join':
+                segments.append((run, False))
+            else:  # 'first'
+                if total <= skip:
+                    segments.append((run, False))
+                else:
+                    k = min(_bold_count(total, ratio), len(run))
+                    segments.append((run[:k], True))
+                    if k < len(run):
+                        segments.append((run[k:], False))
+            prev_end = end
+    if prev_end < len(text):
+        segments.append((text[prev_end:], False))
+    return segments
+
+
+def _fix_named_entities(data):
+    def repl(m):
+        name = m.group(1).decode('ascii')
+        if name.encode() in _SAFE_ENTITIES:
+            return m.group(0)
+        cp = _name2cp.get(name)
+        if cp is not None:
+            return ('&#%d;' % cp).encode('ascii')
+        return m.group(0)
+    return _NAMED_ENT_RE.sub(repl, data)
+
+
+def _process_xhtml(data, ratio, skip):
+    if data.startswith(b'\xef\xbb\xbf'):
+        data = data[3:]
+
+    for m in _NS_RE.finditer(data):
+        prefix = m.group(1).decode('ascii') if m.group(1) else ''
+        uri = m.group(2).decode('utf-8')
+        try:
+            ET.register_namespace(prefix, uri)
+        except (ValueError, TypeError):
+            pass
+
+    hm = _HEAD_RE.match(data)
+    xml_decl = (hm.group(1) or b'<?xml version="1.0" encoding="utf-8"?>').strip()
+    doctype = (hm.group(2) or b'').strip()
+
+    fixed = _fix_named_entities(data)
+    try:
+        root = ET.fromstring(fixed)
+    except ET.ParseError:
+        return data
+
+    def lname(tag):
+        if not isinstance(tag, str):
+            return ''
+        if '}' in tag:
+            return tag.split('}', 1)[1].lower()
+        return tag.lower()
+
+    def make_b_like(parent):
+        if isinstance(parent.tag, str) and '}' in parent.tag:
+            ns = parent.tag.split('}', 1)[0] + '}'
+            return ET.Element(ns + 'b')
+        return ET.Element('b')
+
+    def wrap_tail(child, parent):
+        if not (child.tail and child.tail.strip()):
+            return
+        segs = _build_bionic_segments(child.tail, ratio, skip)
+        if not any(b for _, b in segs):
+            return
+        child.tail = None
+        last = child
+        for stxt, sbold in segs:
+            if sbold:
+                b = make_b_like(parent)
+                b.text = stxt
+                idx = list(parent).index(last)
+                parent.insert(idx + 1, b)
+                last = b
+            else:
+                if last is child:
+                    child.tail = (child.tail or '') + stxt
+                else:
+                    last.tail = (last.tail or '') + stxt
+
+    def process(el):
+        if not isinstance(el.tag, str):
+            return
+        if lname(el.tag) in _XHTML_SKIP:
+            return
+
+        for child in list(el):
+            process(child)
+            wrap_tail(child, el)
+
+        if el.text and el.text.strip():
+            segs = _build_bionic_segments(el.text, ratio, skip)
+            if any(b for _, b in segs):
+                old_children = list(el)
+                for c in old_children:
+                    el.remove(c)
+                el.text = None
+                last = None
+                for stxt, sbold in segs:
+                    if sbold:
+                        b = make_b_like(el)
+                        b.text = stxt
+                        if last is None:
+                            el.insert(0, b)
+                        else:
+                            idx = list(el).index(last)
+                            el.insert(idx + 1, b)
+                        last = b
+                    else:
+                        if last is None:
+                            el.text = (el.text or '') + stxt
+                        else:
+                            last.tail = (last.tail or '') + stxt
+                for c in old_children:
+                    el.append(c)
+
+    process(root)
+
+    body = ET.tostring(root, encoding='utf-8', xml_declaration=False)
+    out = xml_decl + b'\n'
+    if doctype:
+        out += doctype + b'\n'
+    out += body
+    return out
+
+
+def make_bionic_epub(src_path, dst_path, ratio, skip):
+    try:
+        with zipfile.ZipFile(src_path, 'r') as zin:
+            with zipfile.ZipFile(dst_path, 'w') as zout:
+                for item in zin.infolist():
+                    data = zin.read(item.filename)
+                    nl = item.filename.lower()
+                    if nl.endswith(('.xhtml', '.html', '.htm')):
+                        try:
+                            data = _process_xhtml(data, ratio, skip)
+                        except Exception:
+                            pass  # keep original on any failure
+                    zout.writestr(item, data)
+    except zipfile.BadZipFile:
+        raise ValueError('Not a valid EPUB/KEPUB (not a zip archive).')
 `;
 
 // ---------------------------------------------------------------- JS side
 const $ = id => document.getElementById(id);
-let pyodide = null, pyReady = false, busy = false, dlUrl = null, initFailed = false;
+let pyodide = null, pyReady = false, busy = false;
+let dlUrl = null, dlEpubUrl = null, initFailed = false;
 
-function log(msg) {
+function logFont(msg) {
   const el = $('log');
+  el.textContent += msg + '\n';
+  el.scrollTop = el.scrollHeight;
+}
+function logEpub(msg) {
+  const el = $('logEpub');
   el.textContent += msg + '\n';
   el.scrollTop = el.scrollHeight;
 }
 
 function refresh() {
-  $('go').disabled = !(pyReady && !busy && $('regular').files.length);
+  $('go').disabled     = !(pyReady && !busy && $('regular').files.length);
+  $('goEpub').disabled = !(pyReady && !busy && $('epub').files.length);
 }
 
-// Replaces the log with a status line that reflects the current state
-function showStatus() {
-  if (initFailed) return; // keep the error message visible
+function showFontStatus() {
+  if (initFailed) return;
   const f = $('regular').files[0];
   $('log').textContent = '';
   if (!pyReady) {
-    log(f ? `Selected: ${f.name}. Waiting for the Python runtime to finish loading...`
-          : 'Loading Python runtime (first visit only, may take a bit)...');
+    logFont(f ? `Selected: ${f.name}. Waiting for the Python runtime to finish loading...`
+              : 'Loading Python runtime (first visit only, may take a bit)...');
   } else {
-    log(f ? `Selected: ${f.name}. Press "Generate font".`
-          : 'Ready. Choose a font file.');
+    logFont(f ? `Selected: ${f.name}. Press "Generate font".`
+              : 'Ready. Choose a font file.');
   }
 }
 
-// Enables the download button with a file, or dims it (url = null) until there is one
-function setDownload(url, name) {
-  const a = $('dl');
+function showEpubStatus() {
+  if (initFailed) return;
+  const f = $('epub').files[0];
+  $('logEpub').textContent = '';
+  if (!pyReady) {
+    logEpub(f ? `Selected: ${f.name}. Waiting for the Python runtime...`
+              : 'Loading Python runtime...');
+  } else {
+    logEpub(f ? `Selected: ${f.name}. Press "Generate bionic EPUB".`
+              : 'Ready. Choose an EPUB or KEPUB file.');
+  }
+}
+
+function setDownload(url, name, isEpub = false) {
+  const a = isEpub ? $('dlEpub') : $('dl');
   if (url) {
     a.href = url;
     a.download = name;
@@ -324,18 +604,36 @@ function setDownload(url, name) {
   }
 }
 
+for (const tab of document.querySelectorAll('.tab')) {
+  tab.addEventListener('click', () => {
+    for (const t of document.querySelectorAll('.tab')) t.classList.toggle('active', t === tab);
+    for (const p of document.querySelectorAll('.panel')) {
+      p.classList.toggle('active', p.id === tab.dataset.panel);
+    }
+  });
+}
+
 async function initPython() {
   try {
-    showStatus();
+    showFontStatus();
+    showEpubStatus();
     pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
     await pyodide.loadPackage('micropip');
-    await pyodide.pyimport('micropip').install('fonttools');
+    const mp = pyodide.pyimport('micropip');
+    await mp.install('fonttools');
+    try {
+      await mp.install('cu2qu');
+    } catch (e) {
+      console.log('cu2qu install skipped (optional):', e);
+    }
     pyodide.runPython(PY_CODE);
     pyReady = true;
-    showStatus();
+    showFontStatus();
+    showEpubStatus();
   } catch (e) {
     initFailed = true;
-    log('Failed to load runtime:\n' + e);
+    logFont('Failed to load runtime:\n' + e);
+    logEpub('Failed to load runtime:\n' + e);
   }
   refresh();
 }
@@ -343,10 +641,15 @@ async function initPython() {
 $('dl').addEventListener('click', e => {
   if ($('dl').classList.contains('disabled')) e.preventDefault();
 });
-$('regular').addEventListener('change', () => { refresh(); showStatus(); });
-$('ratio').addEventListener('input', e => { $('ratioOut').textContent = e.target.value + '%'; });
+$('dlEpub').addEventListener('click', e => {
+  if ($('dlEpub').classList.contains('disabled')) e.preventDefault();
+});
+
+$('regular').addEventListener('change', () => { refresh(); showFontStatus(); });
+$('epub').addEventListener('change', () => { refresh(); showEpubStatus(); });
 $('weight').addEventListener('input', e => { $('weightOut').textContent = parseFloat(e.target.value).toFixed(3); });
 
+// ---------- Generate font ----------
 $('go').addEventListener('click', async () => {
   busy = true;
   refresh();
@@ -358,13 +661,13 @@ $('go').addEventListener('click', async () => {
     if (boldFile) {
       pyodide.FS.writeFile('/tmp/bold.font', new Uint8Array(await boldFile.arrayBuffer()));
     }
-    const ratio = $('ratio').value / 100;
+    const ratio = DEFAULT_RATIO;
     const weight = parseFloat($('weight').value);
-    const skip = parseInt($('skip').value, 10); // 0 = bold all, 1 = skip 1-letter words, 2 = skip 1-2 letters
+    const skip = parseInt($('skip').value, 10);
     const suffix = ' Bionic';
 
-    log('Processing... (can take several seconds)');
-    await new Promise(r => setTimeout(r, 30)); // let the UI repaint before the heavy work
+    logFont('Processing... (can take several seconds)');
+    await new Promise(r => setTimeout(r, 30));
 
     const boldArg = boldFile ? "'/tmp/bold.font'" : 'None';
     const n = pyodide.runPython(
@@ -379,9 +682,42 @@ $('go').addEventListener('click', async () => {
     dlUrl = URL.createObjectURL(new Blob([out], { type: 'font/' + ext }));
     setDownload(dlUrl, fileName);
 
-    log(`Done: ${n} letter glyphs processed.`);
+    logFont(`Done: ${n} letter glyphs processed.`);
   } catch (e) {
-    log('Error:\n' + e.message);
+    logFont('Error:\n' + e.message);
+  }
+  busy = false;
+  refresh();
+});
+
+// ---------- Generate EPUB ----------
+$('goEpub').addEventListener('click', async () => {
+  busy = true;
+  refresh();
+  setDownload(null, null, true);
+  try {
+    const epubFile = $('epub').files[0];
+    pyodide.FS.writeFile('/tmp/in.epub', new Uint8Array(await epubFile.arrayBuffer()));
+
+    const skip = parseInt($('epubSkip').value, 10);
+
+    logEpub('Processing EPUB... (can take several seconds)');
+    await new Promise(r => setTimeout(r, 30));
+
+    pyodide.runPython(
+      `make_bionic_epub('/tmp/in.epub', '/tmp/out.epub', ${DEFAULT_RATIO}, ${skip})`
+    );
+
+    const out = pyodide.FS.readFile('/tmp/out.epub');
+    const fileName = epubFile.name.replace(/(?:\.kepub)?\.epub$|\.kepub$/i, '') + '-Bionic.epub';
+
+    if (dlEpubUrl) URL.revokeObjectURL(dlEpubUrl);
+    dlEpubUrl = URL.createObjectURL(new Blob([out], { type: 'application/epub+zip' }));
+    setDownload(dlEpubUrl, fileName, true);
+
+    logEpub('Done.');
+  } catch (e) {
+    logEpub('Error:\n' + e.message);
   }
   busy = false;
   refresh();
