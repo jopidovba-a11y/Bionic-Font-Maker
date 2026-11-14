@@ -33,6 +33,16 @@
   .tab.active { color:var(--fg); border-bottom-color:var(--accent); }
   .panel { display:none; }
   .panel.active { display:block; }
+  .progress-box { margin-top:16px; }
+  .progress-track { width:100%; height:12px; overflow:hidden; border-radius:999px;
+    background:var(--line); }
+  .progress-fill { width:0%; height:100%; border-radius:inherit; background:var(--accent);
+    transition:width .18s ease; }
+  .progress-info { display:flex; justify-content:space-between; gap:12px; margin-top:6px;
+    color:var(--muted); font-size:.82rem; }
+  .progress-info span:first-child { min-width:0; overflow-wrap:anywhere; }
+  .progress-info span:last-child { flex-shrink:0; font-variant-numeric:tabular-nums; }
+  [hidden] { display:none !important; }
 </style>
 </head>
 <body>
@@ -67,6 +77,13 @@
 
       <button id="go" disabled>Generate font</button>
       <a id="dl" class="btn disabled" aria-disabled="true">Download</a>
+      <div id="fontProgress" class="progress-box" hidden>
+        <div id="fontProgressTrack" class="progress-track" role="progressbar"
+             aria-label="Font conversion progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="fontProgressBar" class="progress-fill"></div>
+        </div>
+        <div class="progress-info"><span id="fontProgressText">Waiting...</span><span id="fontProgressPct">0%</span></div>
+      </div>
       <pre id="log"></pre>
     </div>
 
@@ -79,7 +96,7 @@
   <div id="epubPanel" class="panel">
     <div class="card">
       <label for="epub">EPUB or KEPUB file</label>
-      <input type="file" id="epub" accept=".epub,.kepub">
+      <input type="file" id="epub" accept=".epub,.kepub,.kepub.epub,application/epub+zip">
 
       <label for="epubSkip">Short words</label>
       <select id="epubSkip">
@@ -88,14 +105,20 @@
         <option value="2">Don't bold words of 1-2 letters</option>
       </select>
 
-      <button id="goEpub" disabled>Generate bionic EPUB</button>
+      <button id="goEpub" disabled>Generate bionic book</button>
       <a id="dlEpub" class="btn disabled" aria-disabled="true">Download</a>
+      <div id="epubProgress" class="progress-box" hidden>
+        <div id="epubProgressTrack" class="progress-track" role="progressbar"
+             aria-label="Book conversion progress" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0">
+          <div id="epubProgressBar" class="progress-fill"></div>
+        </div>
+        <div class="progress-info"><span id="epubProgressText">Waiting...</span><span id="epubProgressPct">0%</span></div>
+      </div>
       <pre id="logEpub"></pre>
     </div>
   </div>
 </main>
 
-<script src="https://cdn.jsdelivr.net/pyodide/v0.26.4/full/pyodide.js"></script>
 <script>
 const PYODIDE_URL = 'https://cdn.jsdelivr.net/pyodide/v0.26.4/full/';
 const MAX_LEN = 14;           // max word length for exact GSUB rules
@@ -103,15 +126,8 @@ const DEFAULT_RATIO = 0.42;   // fixed 42% (previously a slider)
 
 // ---------------------------------------------------------------- Python side
 const PY_CODE = String.raw`
-import io, math, re, unicodedata, zipfile
+import asyncio, io, math, re, unicodedata, zipfile
 import xml.etree.ElementTree as ET
-from fontTools.ttLib import TTFont
-from fontTools.pens.recordingPen import DecomposingRecordingPen
-from fontTools.pens.transformPen import TransformPen
-from fontTools.pens.boundsPen import BoundsPen
-from fontTools.pens.ttGlyphPen import TTGlyphPen
-from fontTools.pens.t2CharStringPen import T2CharStringPen
-from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
 from html.entities import name2codepoint as _name2cp
 
 # cu2qu is only needed in the (rare) CFF-bold + TTF-regular case.
@@ -146,6 +162,7 @@ def _is_letter(cp):
 
 
 def _load(path):
+    from fontTools.ttLib import TTFont
     f = TTFont(path, lazy=False)
     if 'fvar' in f or 'CFF2' in f:
         raise ValueError('Variable fonts are not supported. Use a static font.')
@@ -195,9 +212,27 @@ def _build_fea(names, apos, max_len, ratio, skip):
     return '\n'.join(out)
 
 
-def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_path):
+async def _notify_progress(callback, percent, message):
+    if callback is not None:
+        callback(int(percent), str(message))
+    # Yield to the browser so it can paint the progress bar and handle input.
+    await asyncio.sleep(0)
+
+
+
+async def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_path, progress_cb=None):
+    # Font processing dependencies are imported only when this function is used.
+    from fontTools.pens.recordingPen import DecomposingRecordingPen
+    from fontTools.pens.transformPen import TransformPen
+    from fontTools.pens.boundsPen import BoundsPen
+    from fontTools.pens.ttGlyphPen import TTGlyphPen
+    from fontTools.pens.t2CharStringPen import T2CharStringPen
+    from fontTools.feaLib.builder import addOpenTypeFeaturesFromString
+
+    await _notify_progress(progress_cb, 2, 'Opening font files...')
     font = _load(reg_path)
     bold = _load(bold_path) if bold_path else None
+    await _notify_progress(progress_cb, 8, 'Analyzing font glyphs...')
     is_cff = 'CFF ' in font
     upm = font['head'].unitsPerEm
     gs = font.getGlyphSet()
@@ -215,6 +250,7 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
     old_order = list(font.getGlyphOrder())
     pos = {g: i for i, g in enumerate(old_order)}
     names = sorted(letters, key=lambda g: pos[g])
+    await _notify_progress(progress_cb, 12, f'Found {len(names)} letter glyphs. Preparing replacements...')
 
     r = weight * upm
     rv = r * 0.6
@@ -259,7 +295,8 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
         return pen, (int(adv), lsb)
 
     new_glyphs = {}
-    for g in names:
+    total_names = len(names)
+    for index, g in enumerate(names, 1):
         adv = hmtx[g][0]
         rec = record(gs, g)
         new_glyphs[g + '.tl'] = build(rec, [(1, 0, 0, 1, 0, 0)], adv, False)
@@ -273,27 +310,38 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
             tr = [(1, 0, 0, 1, r + ox, oy) for ox, oy in ring]
             new_glyphs[g + '.bf'] = build(rec, tr, adv + round(2 * r), False)
 
+        if index % 6 == 0 or index == total_names:
+            pct = 12 + int(index / total_names * 58)
+            await _notify_progress(progress_cb, pct, f'Building glyphs: {index}/{total_names}')
+
     new_order = [n for g in names for n in (g + '.bf', g + '.tl')]
+    await _notify_progress(progress_cb, 72, 'Updating font tables...')
     font.setGlyphOrder(old_order + new_order)
 
     if is_cff:
         cff = font['CFF '].cff
         top = cff.topDictIndex[0]
         cs = top.CharStrings
-        for n in new_order:
+        for index, n in enumerate(new_order, 1):
             pen, (adv, lsb) = new_glyphs[n]
             charstring = pen.getCharString(private=top.Private, globalSubrs=cff.GlobalSubrs)
             cs.charStrings[n] = len(cs.charStringsIndex.items)
             cs.charStringsIndex.items.append(charstring)
             top.charset.append(n)
             hmtx.metrics[n] = (adv, lsb)
+            if index % 12 == 0 or index == len(new_order):
+                pct = 72 + int(index / len(new_order) * 10)
+                await _notify_progress(progress_cb, pct, f'Updating font tables: {index}/{len(new_order)}')
     else:
         glyf = font['glyf']
         glyf.glyphOrder = font.getGlyphOrder()
-        for n in new_order:
+        for index, n in enumerate(new_order, 1):
             pen, (adv, lsb) = new_glyphs[n]
             glyf.glyphs[n] = pen.glyph()
             hmtx.metrics[n] = (adv, lsb)
+            if index % 12 == 0 or index == len(new_order):
+                pct = 72 + int(index / len(new_order) * 10)
+                await _notify_progress(progress_cb, pct, f'Updating font tables: {index}/{len(new_order)}')
     font['maxp'].numGlyphs = len(font.getGlyphOrder())
 
     for tag in ('hdmx', 'LTSH', 'VDMX', 'DSIG'):
@@ -306,9 +354,13 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
         if g and NAME_OK.match(g) and g not in apos:
             apos.append(g)
 
+    await _notify_progress(progress_cb, 84, 'Building OpenType substitution rules...')
     fea = _build_fea(names, apos, int(max_len), float(ratio), int(skip))
+    # Keep the original font-generation behavior: build the contextual
+    # substitution table exactly as in the previously working version.
     addOpenTypeFeaturesFromString(font, fea, tables=['GSUB'])
 
+    await _notify_progress(progress_cb, 93, 'Updating font metadata...')
     tag = suffix.replace(' ', '')
     for rec in font['name'].names:
         s = rec.toUnicode()
@@ -319,7 +371,9 @@ def make_bionic(reg_path, bold_path, weight, ratio, skip, max_len, suffix, out_p
         elif rec.nameID == 6:
             rec.string = s.replace('-', tag + '-', 1) if '-' in s else s + tag
 
+    await _notify_progress(progress_cb, 97, 'Saving generated font...')
     font.save(out_path)
+    await _notify_progress(progress_cb, 100, 'Font conversion complete.')
     return len(names)
 
 
@@ -435,11 +489,18 @@ def _process_xhtml(data, ratio, skip):
 
     hm = _HEAD_RE.match(data)
     xml_decl = (hm.group(1) or b'<?xml version="1.0" encoding="utf-8"?>').strip()
+    if hm.group(1):
+        # The serialized body below is UTF-8 regardless of the source encoding.
+        xml_decl = re.sub(
+            rb'encoding\s*=\s*(["\']).*?\1',
+            b'encoding="utf-8"', xml_decl, count=1, flags=re.IGNORECASE
+        )
     doctype = (hm.group(2) or b'').strip()
 
     fixed = _fix_named_entities(data)
     try:
-        root = ET.fromstring(fixed)
+        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True, insert_pis=True))
+        root = ET.fromstring(fixed, parser=parser)
     except ET.ParseError:
         return data
 
@@ -523,27 +584,158 @@ def _process_xhtml(data, ratio, skip):
     return out
 
 
-def make_bionic_epub(src_path, dst_path, ratio, skip):
-    try:
-        with zipfile.ZipFile(src_path, 'r') as zin:
-            with zipfile.ZipFile(dst_path, 'w') as zout:
-                for item in zin.infolist():
-                    data = zin.read(item.filename)
-                    nl = item.filename.lower()
-                    if nl.endswith(('.xhtml', '.html', '.htm')):
-                        try:
-                            data = _process_xhtml(data, ratio, skip)
-                        except Exception:
-                            pass  # keep original on any failure
-                    zout.writestr(item, data)
-    except zipfile.BadZipFile:
-        raise ValueError('Not a valid EPUB/KEPUB (not a zip archive).')
+async def make_bionic_epub(src_path, dst_path, ratio, skip, progress_cb=None):
+    # EPUB and Kobo KEPUB are both ZIP-based containers. Check the actual
+    # file contents rather than trusting the filename extension.
+    await _notify_progress(progress_cb, 1, 'Checking book archive...')
+    if not zipfile.is_zipfile(src_path):
+        with open(src_path, 'rb') as src:
+            header = src.read(12)
+            src.seek(0, 2)
+            size = src.tell()
+        header_hex = ' '.join(f'{value:02X}' for value in header) or '(empty)'
+        if size == 0:
+            reason = 'The selected file is empty.'
+        elif header.startswith(b'PK'):
+            reason = 'The file begins with a ZIP signature, but its ZIP directory is damaged or incomplete.'
+        else:
+            reason = 'The file contents are not a ZIP archive. A .kepub.epub filename alone does not make the file a KEPUB.'
+        raise ValueError(
+            f'{reason} File size: {size} bytes. First bytes: {header_hex}. '
+            'Please select the actual downloaded EPUB/KEPUB file and make sure it finished downloading.'
+        )
+
+    with zipfile.ZipFile(src_path, 'r') as zin:
+        items = zin.infolist()
+        total_items = len(items)
+        total_bytes = sum(max(item.file_size, 1) for item in items) or 1
+        processed_bytes = 0
+        with zipfile.ZipFile(dst_path, 'w') as zout:
+            zout.comment = zin.comment
+            for index, item in enumerate(items, 1):
+                current_pct = 3 + int(processed_bytes / total_bytes * 94)
+                await _notify_progress(
+                    progress_cb, current_pct,
+                    f'Processing {index}/{total_items}: {item.filename}'
+                )
+                data = zin.read(item)
+                nl = item.filename.lower()
+                if nl.endswith(('.xhtml', '.html', '.htm')):
+                    try:
+                        data = _process_xhtml(data, ratio, skip)
+                    except Exception:
+                        pass  # keep original on any failure
+                zout.writestr(item, data)
+                processed_bytes += max(item.file_size, 1)
+                completed_pct = 3 + int(processed_bytes / total_bytes * 94)
+                await _notify_progress(
+                    progress_cb, min(completed_pct, 97),
+                    f'Processed {index}/{total_items} files'
+                )
+
+    await _notify_progress(progress_cb, 100, 'Book conversion complete.')
 `;
 
 // ---------------------------------------------------------------- JS side
 const $ = id => document.getElementById(id);
-let pyodide = null, pyReady = false, busy = false;
-let dlUrl = null, dlEpubUrl = null, initFailed = false;
+let pyodide = null;
+let pyodideScriptPromise = null;
+let pyodidePromise = null;
+let fontToolsPromise = null;
+let fontToolsReady = false;
+let busy = false;
+let dlUrl = null, dlEpubUrl = null;
+
+function updateProgress(kind, percent, message) {
+  const value = Math.max(0, Math.min(100, Math.round(Number(percent) || 0)));
+  const root = $(kind + 'Progress');
+  root.hidden = false;
+  $(kind + 'ProgressBar').style.width = value + '%';
+  $(kind + 'ProgressTrack').setAttribute('aria-valuenow', String(value));
+  $(kind + 'ProgressPct').textContent = value + '%';
+  $(kind + 'ProgressText').textContent = message || 'Processing...';
+}
+
+function resetProgress(kind) {
+  const root = $(kind + 'Progress');
+  root.hidden = true;
+  $(kind + 'ProgressBar').style.width = '0%';
+  $(kind + 'ProgressTrack').setAttribute('aria-valuenow', '0');
+  $(kind + 'ProgressPct').textContent = '0%';
+  $(kind + 'ProgressText').textContent = 'Waiting...';
+}
+
+function makePythonProgressCallback(kind, start = 0, span = 100) {
+  return (percent, message) => {
+    updateProgress(kind, start + (Math.max(0, Math.min(100, Number(percent) || 0)) / 100) * span, message);
+  };
+}
+
+// Load Pyodide's small JavaScript loader only when the user starts a conversion.
+function loadPyodideScript() {
+  if (typeof loadPyodide === 'function') return Promise.resolve();
+  if (!pyodideScriptPromise) {
+    pyodideScriptPromise = new Promise((resolve, reject) => {
+      const script = document.createElement('script');
+      script.src = PYODIDE_URL + 'pyodide.js';
+      script.onload = () => resolve();
+      script.onerror = () => {
+        script.remove();
+        pyodideScriptPromise = null;
+        reject(new Error('Could not download the Pyodide loader. Check your connection and try again.'));
+      };
+      document.head.appendChild(script);
+    });
+  }
+  return pyodideScriptPromise;
+}
+
+// Share one Python runtime between both tools. FontTools is installed only for font conversion.
+async function ensurePython({ withFontTools = false, onProgress = null } = {}) {
+  if (!pyodide) {
+    if (onProgress) onProgress(4, 'Loading Pyodide runtime...');
+    if (!pyodidePromise) {
+      pyodidePromise = (async () => {
+        await loadPyodideScript();
+        const runtime = await loadPyodide({ indexURL: PYODIDE_URL });
+        runtime.runPython(PY_CODE);
+        return runtime;
+      })().catch(error => {
+        pyodidePromise = null;
+        throw error;
+      });
+    }
+    pyodide = await pyodidePromise;
+    if (onProgress) onProgress(24, 'Python runtime ready.');
+  }
+
+  if (withFontTools && !fontToolsReady) {
+    if (onProgress) onProgress(28, 'Loading font-processing libraries...');
+    if (!fontToolsPromise) {
+      fontToolsPromise = (async () => {
+        await pyodide.loadPackage('micropip');
+        if (onProgress) onProgress(38, 'Preparing fontTools...');
+        const mp = pyodide.pyimport('micropip');
+        await mp.install('fonttools');
+        if (onProgress) onProgress(56, 'Checking optional font conversion support...');
+        try {
+          await mp.install('cu2qu');
+        } catch (error) {
+          // Optional: only needed for CFF-bold + TTF-regular conversion.
+          console.warn('Optional cu2qu installation skipped:', error);
+        }
+      })().catch(error => {
+        fontToolsPromise = null;
+        throw error;
+      });
+    }
+    await fontToolsPromise;
+    fontToolsReady = true;
+    if (onProgress) onProgress(68, 'Font libraries ready.');
+  }
+
+  return pyodide;
+}
 
 function logFont(msg) {
   const el = $('log');
@@ -557,34 +749,44 @@ function logEpub(msg) {
 }
 
 function refresh() {
-  $('go').disabled     = !(pyReady && !busy && $('regular').files.length);
-  $('goEpub').disabled = !(pyReady && !busy && $('epub').files.length);
+  // The buttons become available as soon as a file is selected; Python loads on demand.
+  $('go').disabled     = !(!busy && $('regular').files.length);
+  $('goEpub').disabled = !(!busy && $('epub').files.length);
 }
 
 function showFontStatus() {
-  if (initFailed) return;
   const f = $('regular').files[0];
   $('log').textContent = '';
-  if (!pyReady) {
-    logFont(f ? `Selected: ${f.name}. Waiting for the Python runtime to finish loading...`
-              : 'Loading Python runtime (first visit only, may take a bit)...');
-  } else {
-    logFont(f ? `Selected: ${f.name}. Press "Generate font".`
-              : 'Ready. Choose a font file.');
-  }
+  logFont(f ? `Selected: ${f.name}. Press "Generate font".`
+            : 'Choose a font file. Python loads when you generate it.');
 }
 
 function showEpubStatus() {
-  if (initFailed) return;
   const f = $('epub').files[0];
   $('logEpub').textContent = '';
-  if (!pyReady) {
-    logEpub(f ? `Selected: ${f.name}. Waiting for the Python runtime...`
-              : 'Loading Python runtime...');
-  } else {
-    logEpub(f ? `Selected: ${f.name}. Press "Generate bionic EPUB".`
-              : 'Ready. Choose an EPUB or KEPUB file.');
+  logEpub(f ? `Selected: ${f.name}. Press "Generate bionic book".`
+            : 'Choose an EPUB or KEPUB file. Python loads when you generate it.');
+}
+
+function getBookNameParts(fileName) {
+  const lower = fileName.toLowerCase();
+  if (lower.endsWith('.kepub.epub')) {
+    return { base: fileName.slice(0, -'.kepub.epub'.length), format: 'kepub', suffix: '.kepub.epub' };
   }
+  if (lower.endsWith('.kepub')) {
+    return { base: fileName.slice(0, -'.kepub'.length), format: 'kepub', suffix: '.kepub' };
+  }
+  if (lower.endsWith('.epub')) {
+    return { base: fileName.slice(0, -'.epub'.length), format: 'epub', suffix: '.epub' };
+  }
+  // The file picker normally prevents this, but keep a safe EPUB fallback.
+  return { base: fileName, format: 'epub', suffix: '.epub' };
+}
+
+function getBookOutputName(fileName) {
+  // Preserve the exact input extension, including .kepub.epub and .kepub.
+  const input = getBookNameParts(fileName);
+  return input.base + '-Bionic' + input.suffix;
 }
 
 function setDownload(url, name, isEpub = false) {
@@ -613,31 +815,6 @@ for (const tab of document.querySelectorAll('.tab')) {
   });
 }
 
-async function initPython() {
-  try {
-    showFontStatus();
-    showEpubStatus();
-    pyodide = await loadPyodide({ indexURL: PYODIDE_URL });
-    await pyodide.loadPackage('micropip');
-    const mp = pyodide.pyimport('micropip');
-    await mp.install('fonttools');
-    try {
-      await mp.install('cu2qu');
-    } catch (e) {
-      console.log('cu2qu install skipped (optional):', e);
-    }
-    pyodide.runPython(PY_CODE);
-    pyReady = true;
-    showFontStatus();
-    showEpubStatus();
-  } catch (e) {
-    initFailed = true;
-    logFont('Failed to load runtime:\n' + e);
-    logEpub('Failed to load runtime:\n' + e);
-  }
-  refresh();
-}
-
 $('dl').addEventListener('click', e => {
   if ($('dl').classList.contains('disabled')) e.preventDefault();
 });
@@ -645,17 +822,28 @@ $('dlEpub').addEventListener('click', e => {
   if ($('dlEpub').classList.contains('disabled')) e.preventDefault();
 });
 
-$('regular').addEventListener('change', () => { refresh(); showFontStatus(); });
-$('epub').addEventListener('change', () => { refresh(); showEpubStatus(); });
+$('regular').addEventListener('change', () => { resetProgress('font'); refresh(); showFontStatus(); });
+$('epub').addEventListener('change', () => { resetProgress('epub'); refresh(); showEpubStatus(); });
 $('weight').addEventListener('input', e => { $('weightOut').textContent = parseFloat(e.target.value).toFixed(3); });
 
 // ---------- Generate font ----------
 $('go').addEventListener('click', async () => {
+  const regFile = $('regular').files[0];
+  if (!regFile || busy) return;
+
   busy = true;
   refresh();
   setDownload(null);
+  resetProgress('font');
+  updateProgress('font', 1, 'Preparing font conversion...');
   try {
-    const regFile = $('regular').files[0];
+    logFont('Loading Python runtime and font libraries... (first use only)');
+    await new Promise(r => setTimeout(r, 30));
+    await ensurePython({
+      withFontTools: true,
+      onProgress: (percent, message) => updateProgress('font', percent * 0.35, message)
+    });
+
     const boldFile = $('bold').files[0];
     pyodide.FS.writeFile('/tmp/reg.font', new Uint8Array(await regFile.arrayBuffer()));
     if (boldFile) {
@@ -666,13 +854,21 @@ $('go').addEventListener('click', async () => {
     const skip = parseInt($('skip').value, 10);
     const suffix = ' Bionic';
 
-    logFont('Processing... (can take several seconds)');
+    logFont('Processing font...');
+    updateProgress('font', 36, 'Starting font conversion...');
     await new Promise(r => setTimeout(r, 30));
 
     const boldArg = boldFile ? "'/tmp/bold.font'" : 'None';
-    const n = pyodide.runPython(
-      `make_bionic('/tmp/reg.font', ${boldArg}, ${weight}, ${ratio}, ${skip}, ${MAX_LEN}, ${JSON.stringify(suffix)}, '/tmp/out.font')`
-    );
+    const progressCallback = makePythonProgressCallback('font', 36, 63);
+    pyodide.globals.set('_progress_callback', progressCallback);
+    let n;
+    try {
+      n = await pyodide.runPythonAsync(
+        `await make_bionic('/tmp/reg.font', ${boldArg}, ${weight}, ${ratio}, ${skip}, ${MAX_LEN}, ${JSON.stringify(suffix)}, '/tmp/out.font', _progress_callback)`
+      );
+    } finally {
+      pyodide.globals.delete('_progress_callback');
+    }
 
     const out = pyodide.FS.readFile('/tmp/out.font');
     const ext = ((regFile.name.match(/\.(ttf|otf)$/i) || [])[1] || 'ttf').toLowerCase();
@@ -682,48 +878,76 @@ $('go').addEventListener('click', async () => {
     dlUrl = URL.createObjectURL(new Blob([out], { type: 'font/' + ext }));
     setDownload(dlUrl, fileName);
 
+    updateProgress('font', 100, 'Complete.');
     logFont(`Done: ${n} letter glyphs processed.`);
   } catch (e) {
-    logFont('Error:\n' + e.message);
+    logFont('Error:\n' + (e && e.message ? e.message : String(e)));
+    updateProgress('font', Number($('fontProgressTrack').getAttribute('aria-valuenow')) || 0, 'Conversion stopped.');
+  } finally {
+    busy = false;
+    refresh();
   }
-  busy = false;
-  refresh();
 });
 
 // ---------- Generate EPUB ----------
 $('goEpub').addEventListener('click', async () => {
+  const epubFile = $('epub').files[0];
+  if (!epubFile || busy) return;
+
   busy = true;
   refresh();
   setDownload(null, null, true);
+  resetProgress('epub');
+  updateProgress('epub', 1, 'Preparing book conversion...');
   try {
-    const epubFile = $('epub').files[0];
-    pyodide.FS.writeFile('/tmp/in.epub', new Uint8Array(await epubFile.arrayBuffer()));
+    logEpub('Loading Python runtime... (first use only)');
+    await new Promise(r => setTimeout(r, 30));
+    await ensurePython({ onProgress: (percent, message) => updateProgress('epub', percent * 0.08, message) });
 
+    const inputBuffer = await epubFile.arrayBuffer();
+    if (inputBuffer.byteLength !== epubFile.size) {
+      throw new Error(`The selected file could not be read completely (${inputBuffer.byteLength} of ${epubFile.size} bytes). Please try selecting it again.`);
+    }
+    const inputBytes = new Uint8Array(inputBuffer);
+    pyodide.FS.writeFile('/tmp/in.epub', inputBytes);
     const skip = parseInt($('epubSkip').value, 10);
 
-    logEpub('Processing EPUB... (can take several seconds)');
+    logEpub('Processing book contents...');
+    updateProgress('epub', 8, 'Starting book conversion...');
     await new Promise(r => setTimeout(r, 30));
 
-    pyodide.runPython(
-      `make_bionic_epub('/tmp/in.epub', '/tmp/out.epub', ${DEFAULT_RATIO}, ${skip})`
-    );
+    const progressCallback = makePythonProgressCallback('epub', 8, 92);
+    pyodide.globals.set('_progress_callback', progressCallback);
+    try {
+      await pyodide.runPythonAsync(
+        `await make_bionic_epub('/tmp/in.epub', '/tmp/out.epub', ${DEFAULT_RATIO}, ${skip}, _progress_callback)`
+      );
+    } finally {
+      pyodide.globals.delete('_progress_callback');
+    }
 
     const out = pyodide.FS.readFile('/tmp/out.epub');
-    const fileName = epubFile.name.replace(/(?:\.kepub)?\.epub$|\.kepub$/i, '') + '-Bionic.epub';
+    const fileName = getBookOutputName(epubFile.name);
 
     if (dlEpubUrl) URL.revokeObjectURL(dlEpubUrl);
     dlEpubUrl = URL.createObjectURL(new Blob([out], { type: 'application/epub+zip' }));
     setDownload(dlEpubUrl, fileName, true);
 
-    logEpub('Done.');
+    updateProgress('epub', 100, 'Complete.');
+    logEpub(`Done: ${fileName}`);
   } catch (e) {
-    logEpub('Error:\n' + e.message);
+    logEpub('Error:\n' + (e && e.message ? e.message : String(e)));
+    updateProgress('epub', Number($('epubProgressTrack').getAttribute('aria-valuenow')) || 0, 'Conversion stopped.');
+  } finally {
+    busy = false;
+    refresh();
   }
-  busy = false;
-  refresh();
 });
 
-initPython();
+// No runtime initialization here: the page is interactive immediately.
+refresh();
+showFontStatus();
+showEpubStatus();
 </script>
 </body>
 </html>
